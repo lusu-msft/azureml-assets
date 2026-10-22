@@ -1,20 +1,44 @@
-FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202609.1
+FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202610.2
 
 USER root
 
 # OS packages inherited from the ACPT base image but still below current
-# Ubuntu security versions; fixes USN-8678-1, USN-8670-2, USN-8651-1, and USN-8675-1.
+# Ubuntu security versions; fixes USN-8678-1, USN-8670-2, USN-8651-1, USN-8675-1,
+# USN-8687-1, USN-8691-1, USN-8699-1, USN-8692-1, USN-8697-1, USN-8711-1,
+# USN-8710-1, USN-8721-1, USN-8736-1, USN-8737-1, USN-8740-1, and USN-8744-1.
 RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade \
-    libssl-dev=3.0.2-0ubuntu1.29 \
-    libssl3=3.0.2-0ubuntu1.29 \
-    openssl=3.0.2-0ubuntu1.29 \
-    libcurl4=7.81.0-1ubuntu1.27 \
-    curl=7.81.0-1ubuntu1.27 \
-    libcurl3-gnutls=7.81.0-1ubuntu1.27 \
-    libperl5.34=5.34.0-3ubuntu1.8 \
-    perl=5.34.0-3ubuntu1.8 \
-    perl-modules-5.34=5.34.0-3ubuntu1.8 \
-    perl-base=5.34.0-3ubuntu1.8 \
+    libssl-dev \
+    libssl3 \
+    openssl \
+    libcurl4 \
+    curl \
+    libcurl3-gnutls \
+    libperl5.34 \
+    perl \
+    perl-modules-5.34 \
+    perl-base \
+    libp11-kit0 \
+    libattr1 \
+    libssh-4 \
+    diffutils \
+    coreutils \
+    libgcrypt20 \
+    libevent-core-2.1-7 \
+    libexpat1 \
+    libxml2 \
+    openssh-client \
+    libc6-dev \
+    libc-bin \
+    libc6 \
+    libc-dev-bin \
+    locales \
+    dotnet-runtime-8.0 \
+    dotnet-hostfxr-8.0 \
+    dotnet-host \
+    python3.10 \
+    python3.10-minimal \
+    libpython3.10-minimal \
+    libpython3.10-stdlib \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -37,10 +61,11 @@ RUN pip install -r requirements.txt --no-cache-dir \
 RUN pip uninstall -y onnx && pip install --no-cache-dir 'onnx-weekly>=1.22.0.dev20260504'
 
 # pyarrow: pinned transitive dep of datasets; image install downgrades the base, fixes CVE-2026-25087.
-# aiohttp: pinned inherited dep from the ACPT base image; fixes GHSA-mq44-7p77-q5h7, GHSA-cq5v-8q36-5273, and GHSA-mfx4-hv73-q22v.
+# aiohttp and anyio: pinned inherited deps from the ACPT base image; fix current GHSA findings.
 # cryptography: pinned inherited base dep and transitive dep of azureml-core in ptca; fixes GHSA-g6cj-pr64-35w5.
 RUN /opt/conda/bin/python -m pip install --no-cache-dir --upgrade \
     'aiohttp>=3.14.3' \
+    'anyio>=4.14.2' \
     'cryptography>=50.0.0' \
  && conda run -n ptca python -m pip install --no-cache-dir --upgrade \
     'aiohttp>=3.14.3' \
@@ -67,3 +92,20 @@ RUN find /opt/conda -path '*/site-packages/pip/_vendor/bom.cdx.json' -delete \
  && find /opt/conda -path '*/site-packages/pip/_vendor/vendor.txt' -delete
 
 RUN conda clean -a -y && rm -rf /opt/miniconda/pkgs/
+
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="curl libcurl3-gnutls libcurl4 libevent-core-2.1-7 libssl-dev libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Reassert newly patched transitive dependencies after all package installs.
+RUN /opt/conda/bin/python -m pip install --no-cache-dir --upgrade 'PyJWT>=2.15.0' 'urllib3>=2.8.0'

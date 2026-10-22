@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Union
 
 from typing_extensions import overload, override
 
-from azure.ai.evaluation._evaluators._common import PromptyEvaluatorBase
+from azure.ai.evaluation._evaluators import _common as _sdk_common
 from azure.ai.evaluation._model_configurations import Conversation
 from azure.ai.evaluation._exceptions import EvaluationException, ErrorBlame, ErrorCategory, ErrorTarget
 from azure.ai.evaluation._constants import EVALUATION_PASS_FAIL_MAPPING
@@ -27,7 +27,6 @@ from azure.ai.evaluation._constants import EVALUATION_PASS_FAIL_MAPPING
 from azure.ai.evaluation._common.constants import PROMPT_BASED_REASON_EVALUATORS
 from azure.ai.evaluation._common.utils import (
     parse_quality_evaluator_reason_score,
-    reformat_agent_response,
 )
 from azure.ai.evaluation._evaluators._common._validators import (
     ValidatorInterface,
@@ -52,7 +51,12 @@ except ImportError:  # azure-ai-evaluation 1.17.x (backward compat; remove when 
             default=-1,
         )
         if latest_user_index == -1:
-            raise ValueError("messages must contain at least one message with role 'user'.")
+            raise EvaluationException(
+                message="messages must contain at least one message with role 'user'.",
+                blame=ErrorBlame.USER_ERROR,
+                category=ErrorCategory.INVALID_VALUE,
+                target=ErrorTarget.FLUENCY_EVALUATOR,
+            )
         return messages[: latest_user_index + 1], messages[latest_user_index + 1:]
 
 # Re-exported so the module keeps exposing the message-preprocessing helpers used
@@ -68,10 +72,72 @@ except ImportError:  # azure-ai-evaluation 1.17.x (backward compat; remove when 
         _normalize_function_call_types,
     )
 
+
+ModelEvaluatorBase = getattr(_sdk_common, "ModelEvaluatorBase", _sdk_common.PromptyEvaluatorBase)
+try:
+    from azure.ai.evaluation._evaluators._common._decision_strategy import LikertScoring, DecisionEvaluationStrategy
+except ImportError as exc:
+    if exc.name != "azure.ai.evaluation._evaluators._common._decision_strategy":
+        raise
+    LikertScoring = DecisionEvaluationStrategy = None
+_SDK_SUPPORTS_DECISION = (
+    hasattr(_sdk_common, "ModelEvaluatorBase") and LikertScoring is not None and DecisionEvaluationStrategy is not None
+)
+
+
 logger = logging.getLogger(__name__)
 
 
-class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
+def _parse_json_response_if_applicable(response):
+    """Parse ``response`` as JSON when it is a JSON-encoded string of chat messages.
+
+    If ``response`` is a string that successfully parses as JSON into a list, the parsed
+    list is returned so it can be handled by the existing message-list preprocessing path.
+    Any other input (a plain string, an already-parsed list, or a string that fails to
+    parse as JSON) is returned unchanged.
+
+    :param response: The raw response value from the eval input.
+    :type response: Any
+    :return: The parsed list of messages, or the original response if it is not a
+        JSON-encoded list.
+    :rtype: Any
+    """
+    if isinstance(response, str):
+        try:
+            parsed = json.loads(response)
+        except (ValueError, TypeError):
+            return response
+        if isinstance(parsed, list):
+            return parsed
+    return response
+
+
+def _extract_final_text_response(response):
+    """Flatten a preprocessed list of chat messages into plain assistant text.
+
+    Only the ``text`` content of ``assistant`` role messages is collected; tool
+    calls, tool results, and any other message types are dropped so the evaluator
+    only ever scores the final plain-text agent response. Non-list inputs (e.g. an
+    already plain-string response) are returned unchanged.
+
+    :param response: A preprocessed list of chat-message dicts, or a plain string.
+    :type response: Any
+    :return: The joined plain text of all assistant messages, or the original
+        ``response`` if it is not a list.
+    :rtype: Any
+    """
+    if not isinstance(response, list):
+        return response
+    text_lines = []
+    for msg in response:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            for content in msg.get("content", []) or []:
+                if isinstance(content, dict) and "text" in content:
+                    text_lines.append(content["text"])
+    return "\n".join(text_lines)
+
+
+class FluencyEvaluator(ModelEvaluatorBase[Union[str, float]]):
     """
     Evaluates the fluency of a given response or a multi-turn conversation, including reasoning.
 
@@ -80,7 +146,9 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
 
     Fluency scores range from 1 to 5, with 1 being the least fluent and 5 being the most fluent.
 
-    :param model_config: Configuration for the Azure OpenAI model.
+    :param model_config: Configuration for the Azure OpenAI model. Set ``type="decision"`` with
+        a Foundry ``azure_endpoint`` and ``azure_deployment`` to use a native Decision model;
+        authenticate with ``api_key`` or ``credential``.
     :type model_config: Union[~azure.ai.evaluation.AzureOpenAIModelConfiguration,
         ~azure.ai.evaluation.OpenAIModelConfiguration]
     :param threshold: The threshold for the fluency evaluator. Default is 3.
@@ -127,6 +195,8 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
     """
 
     _PROMPTY_FILE = "fluency.prompty"
+    _DECISION_FILE = "fluency.decision.yaml"
+    _supports_decision_models = True
     _RESULT_KEY = "fluency"
 
     _validator: ValidatorInterface
@@ -154,6 +224,15 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         # Initialize input validator
         self._validator = ConversationValidator(error_target=ErrorTarget.FLUENCY_EVALUATOR, requires_query=False)
 
+        decision_selected = isinstance(model_config, dict) and model_config.get("type") == "decision"
+        if decision_selected and not _SDK_SUPPORTS_DECISION:
+            raise EvaluationException(
+                message="Decision models require an azure-ai-evaluation version with decision model support.",
+                blame=ErrorBlame.USER_ERROR,
+                category=ErrorCategory.INVALID_VALUE,
+                target=ErrorTarget.FLUENCY_EVALUATOR,
+            )
+
         super().__init__(
             model_config=model_config,
             prompty_file=prompty_path,
@@ -162,6 +241,27 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             credential=credential,
             _higher_is_better=self._higher_is_better,
             **kwargs,
+        )
+
+        self._decision = None
+        if decision_selected:
+            self._decision = self._decision_strategy(os.path.join(current_dir, self._DECISION_FILE))
+            return
+
+    def _decision_strategy(self, rubric_path: str):
+        """Load this package's rubric and reuse the SDK's native scoring and accounting."""
+        from azure.ai.evaluation._legacy.prompty._yaml_utils import load_yaml
+
+        rubric = json.loads(json.dumps(load_yaml(rubric_path)))
+        runner = self._decision_model_runner
+        return DecisionEvaluationStrategy(
+            runner,
+            result_key=self._result_key,
+            error_target=ErrorTarget.FLUENCY_EVALUATOR,
+            questions={"status": rubric["status"], self._result_key: rubric["result"]},
+            scoring=LikertScoring(5, minimum=1),
+            threshold=self._threshold,
+            timeout=self._LLM_CALL_TIMEOUT,
         )
 
     @overload
@@ -222,7 +322,7 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         return super().__call__(*args, **kwargs)
 
     def _return_not_applicable_result(
-        self, error_message: str, threshold: Union[int, float]
+        self, error_message: str, threshold: Union[int, float], prompty_output=None
     ) -> Dict[str, Union[str, float, Dict, None]]:
         """Return a result indicating that the tool call is not applicable for evaluation.
 
@@ -230,10 +330,12 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         :type error_message: str
         :param threshold: The threshold value for the evaluation.
         :type threshold: Union[int, float]
+        :param prompty_output: Optional paid model response whose usage must be retained for a skip.
+        :type prompty_output: Optional[Dict]
         :return: A dictionary containing the result of the evaluation.
         :rtype: Dict[str, Union[str, float, None]]
         """
-        token_metadata = self._get_token_metadata({})
+        token_metadata = self._get_token_metadata(prompty_output or {})
         result = {
             f"{self._result_key}": None,
             f"{self._result_key}_score": None,
@@ -246,6 +348,17 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         }
         # Add top-level token metadata fields for backward compatibility.
         result.update({f"{self._result_key}_{key}": value for key, value in token_metadata.items()})
+        if prompty_output is not None:
+            answer = prompty_output.get("llm_output", prompty_output)
+            if isinstance(answer, str):
+                try:
+                    answer = json.loads(answer)
+                except (ValueError, TypeError):
+                    answer = {}
+            properties = answer.get("properties") if isinstance(answer, dict) else None
+            properties = dict(properties) if isinstance(properties, dict) else {}
+            properties.update(token_metadata)
+            result[f"{self._result_key}_properties"] = properties
         return result
 
     async def _the_super_do_eval(self, eval_input: Dict) -> Dict[str, Union[float, str]]:
@@ -277,6 +390,9 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             eval_input["query"] = _preprocess_messages(eval_input["query"])
         # Call the prompty flow to get the evaluation result.
         eval_input.pop("messages", None)
+        if self._decision is not None:
+            # The native state is exactly the input fluency.prompty renders: the prepared response.
+            return await self._decision.evaluate({"response": eval_input["response"]})
         prompty_output_dict = await self._flow(timeout=self._LLM_CALL_TIMEOUT, **eval_input)
         score = math.nan
         reason = ""
@@ -295,7 +411,7 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
                 llm_status = parsed_output.get("status", "completed")
                 if llm_status == "skipped":
                     skip_reason = parsed_output.get("reason", "")
-                    return self._return_not_applicable_result(skip_reason, self._threshold)
+                    return self._return_not_applicable_result(skip_reason, self._threshold, prompty_output_dict)
                 score = parsed_output.get("score", math.nan)
                 reason = parsed_output.get("reason", "")
                 llm_properties = parsed_output.get("properties", {}) or {}
@@ -354,7 +470,15 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         """
         messages = kwargs.pop("messages", None)
         if messages is not None:
-            query_messages, response_messages = _split_messages_at_latest_user(messages)
+            try:
+                query_messages, response_messages = _split_messages_at_latest_user(messages)
+            except ValueError as exc:
+                raise EvaluationException(
+                    message=str(exc),
+                    blame=ErrorBlame.USER_ERROR,
+                    category=ErrorCategory.INVALID_VALUE,
+                    target=ErrorTarget.FLUENCY_EVALUATOR,
+                ) from exc
             kwargs["query"] = query_messages
             kwargs["response"] = response_messages
 
@@ -371,6 +495,9 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         :return: The evaluation result.
         :rtype: Union[DoEvalResult[T_EvalValue], AggregateResult[T_EvalValue]]
         """
+        if self._decision is not None:
+            return await super()._real_call(**kwargs)
+
         # Convert inputs into list of evaluable inputs.
         try:
             eval_input_list = self._convert_kwargs_to_eval_input(**kwargs)
@@ -438,6 +565,8 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         :return: The evaluation result.
         :rtype: Dict
         """
+        eval_input["response"] = _parse_json_response_if_applicable(eval_input.get("response"))
+
         if _is_intermediate_response(eval_input.get("response")):
             return self._return_not_applicable_result(
                 "Intermediate response. Please provide the agent's final response for evaluation.",
@@ -446,7 +575,7 @@ class FluencyEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         if isinstance(eval_input.get("response"), list):
             eval_input["response"] = _preprocess_messages(eval_input["response"])
 
-        eval_input["response"] = reformat_agent_response(eval_input.get("response"), logger)
+        eval_input["response"] = _extract_final_text_response(eval_input.get("response"))
 
         result = await self._the_super_do_eval(eval_input)
 

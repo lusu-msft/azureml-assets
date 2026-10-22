@@ -1,18 +1,19 @@
 $schema: https://azuremlschemas.azureedge.net/latest/model.schema.json
 name: Phi-3-mini-128k-instruct-generic-cpu
 path: ./
-isArchived: true
 tags:
   contextLength: 131072
   capabilities: ''
   supportsReasoning: ''
 system_metadata:
-  previewType: hideUI
   alias: phi-3-mini-128k
   publisher: Microsoft
+  lifecycle: Generally available
   directoryPath: v3
   foundryLocal: ''
-  deploymentOptions: ['Foundry Local on Devices']
+  deploymentOptions:
+  - Foundry Local on Devices
+  - Foundry Local on Azure Local
   inputModalities:
   - text
   license: MIT

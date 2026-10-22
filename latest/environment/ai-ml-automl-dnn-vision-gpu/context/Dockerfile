@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202609.1
+FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202610.2
 
 ENV AZUREML_CONDA_ENVIRONMENT_PATH=/azureml-envs/azureml-automl-dnn-vision-gpu
 ENV PATH=$AZUREML_CONDA_ENVIRONMENT_PATH/bin:$PATH
@@ -227,6 +227,7 @@ RUN conda run -n base pip install --no-cache-dir --upgrade \
                 'idna>=3.15' \
                 'click>=8.3.3' \
                 'aiohttp>=3.14.0' \
+                'anyio>=4.14.2' \
                 'PyJWT>=2.13.0' \
                 'py-rattler>=0.24.0' \
                 'cryptography>=48.0.1' \
@@ -255,3 +256,20 @@ RUN rm -f /opt/conda/conda-meta/pip-26.0.*.json \
           /opt/conda/envs/ptca/conda-meta/pip-26.0.*.json
 
 ENV LD_LIBRARY_PATH=$AZUREML_CONDA_ENVIRONMENT_PATH/lib:$LD_LIBRARY_PATH
+
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="libevent-core-2.1-7 libssl-dev libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Reassert newly patched transitive dependencies after all package installs.
+RUN /azureml-envs/azureml-automl-dnn-vision-gpu/bin/python -m pip install --no-cache-dir --upgrade 'urllib3>=2.8.0'

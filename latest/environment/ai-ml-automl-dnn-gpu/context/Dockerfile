@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/azureml/openmpi5.0-cuda12.4-ubuntu22.04:20260908.v1
+FROM mcr.microsoft.com/azureml/openmpi5.0-cuda12.4-ubuntu22.04:20261018.v1
 
 USER root
 
@@ -62,11 +62,6 @@ RUN conda create -p $AZUREML_CONDA_ENVIRONMENT_PATH python=3.10 pip=26.0 -y && \
 RUN pip install --upgrade lightgbm==4.6.0
 
 RUN pip install --upgrade --force-reinstall xgboost==1.5.2 pandas==1.5.3
-
-# Install ncurses via conda (C library, not available on pip; single-package solve is trivial)
-RUN conda install -p $AZUREML_CONDA_ENVIRONMENT_PATH \
-    ncurses=6.5 \
-    -c conda-forge -y
 
 # Install packages via pip (avoids conda solver OOM)
 RUN pip install --no-cache-dir \
@@ -177,3 +172,20 @@ RUN set -eux; \
    rm -rf /opt/miniconda/pkgs/
 
 ENV LD_LIBRARY_PATH=$AZUREML_CONDA_ENVIRONMENT_PATH/lib:$LD_LIBRARY_PATH
+
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Reassert newly patched transitive dependencies after all package installs.
+RUN /opt/miniconda/bin/python -m pip install --no-cache-dir --upgrade 'PyJWT>=2.15.0'

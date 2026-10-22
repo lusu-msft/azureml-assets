@@ -1,13 +1,21 @@
-FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202609.1
+FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202610.2
 
 USER root
 
 RUN apt-get -y update && apt-get -y upgrade \
  && apt-get -y install --only-upgrade \
+        coreutils \
         curl \
+        diffutils \
         dotnet-hostfxr-8.0 \
         dotnet-host-8.0 \
         dotnet-runtime-8.0 \
+        libattr1 \
+        libc6 \
+        libc6-dev \
+        libc-bin \
+        libc-dev-bin \
+        libevent-core-2.1-7 \
         libgssapi-krb5-2 \
         libgcrypt20 \
         libk5crypto3 \
@@ -16,15 +24,23 @@ RUN apt-get -y update && apt-get -y upgrade \
         libcurl3-gnutls \
         libcurl4 \
         liblzma5 \
+        libp11-kit0 \
         libperl5.34 \
         libpng16-16 \
+        libpython3.10-minimal \
+        libpython3.10-stdlib \
         libsqlite3-0 \
+        libssh-4 \
         libssl-dev \
         libssl3 \
+        locales \
+        openssh-client \
         openssl \
         perl \
         perl-base \
         perl-modules-5.34 \
+        python3.10 \
+        python3.10-minimal \
         tar \
         wget \
         xz-utils \
@@ -103,4 +119,67 @@ RUN conda run -n base python -m pip install --no-cache-dir --upgrade 'PyJWT>=2.1
            /opt/conda/lib/python3.14/site-packages/msgpack-1.1*.dist-info \
            /opt/conda/lib/python3.14/site-packages/setuptools-70.3.0.dist-info
 
+# pip: direct package manager upgraded in both envs; fixes GHSA-qwm4-qh6w-59xr.
+# anyio: pinned transitive dep of anaconda-cli-base/httpx tooling in base env; brought in by base image, fixes GHSA-5p39-cfhj-2xmp and GHSA-82r6-8w77-94w6.
+RUN conda install -y -n base -c conda-forge 'pip=26.2.0' 'anyio=4.14.2' && \
+    conda run -n ptca python -m pip install --no-cache-dir --upgrade 'pip==26.2.0' && \
+    rm -rf /opt/conda/lib/python3.14/site-packages/pip-26.1*.dist-info \
+           /opt/conda/lib/python3.14/site-packages/anyio-4.12*.dist-info \
+           /opt/conda/envs/ptca/lib/python3.10/site-packages/pip-26.1*.dist-info && \
+    conda clean -ay
+
+# Remove stale scanner metadata while retaining the upgraded installations.
+RUN set -eu; \
+    roots="/opt /root"; \
+    [ ! -d /azureml-envs ] || roots="$roots /azureml-envs"; \
+    find $roots -type f \( \
+        -path '*/site-packages/pip/_vendor/bom.cdx.json' -o \
+        -path '*/site-packages/pip/_vendor/vendor.txt' \
+    \) -delete; \
+    find $roots -type d \( \
+        -name 'setuptools-70.3.0.dist-info' -o \
+        -name 'setuptools-70.3.0.egg-info' -o \
+        -name 'setuptools-70.3.0-py*.egg-info' -o \
+        -name 'msgpack-1.1.2.dist-info' -o \
+        -name 'msgpack-1.1.2.egg-info' -o \
+        -name 'msgpack-1.1.2-py*.egg-info' \
+    \) -prune -exec rm -rf {} +; \
+    find $roots -type f \( \
+        -path '*/conda-meta/setuptools-70.3.0-*.json' -o \
+        -path '*/conda-meta/msgpack-python-1.1.2-*.json' -o \
+        -path '*/conda-meta/msgpack-1.1.2-*.json' \
+    \) -delete; \
+    stale="$(find $roots \( \
+        -path '*/site-packages/pip/_vendor/bom.cdx.json' -o \
+        -path '*/site-packages/pip/_vendor/vendor.txt' -o \
+        -name 'setuptools-70.3.0.dist-info' -o \
+        -name 'setuptools-70.3.0.egg-info' -o \
+        -name 'setuptools-70.3.0-py*.egg-info' -o \
+        -name 'msgpack-1.1.2.dist-info' -o \
+        -name 'msgpack-1.1.2.egg-info' -o \
+        -name 'msgpack-1.1.2-py*.egg-info' -o \
+        -path '*/conda-meta/setuptools-70.3.0-*.json' -o \
+        -path '*/conda-meta/msgpack-python-1.1.2-*.json' -o \
+        -path '*/conda-meta/msgpack-1.1.2-*.json' \
+    \) -print -quit)"; \
+    [ -z "$stale" ] || { echo "stale setuptools/msgpack scanner metadata remains: $stale" >&2; exit 1; }
+
 RUN conda clean -a -y && rm -rf /opt/miniconda/pkgs/
+
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="libevent-core-2.1-7 libssl-dev libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Reassert newly patched transitive dependencies after all package installs.
+RUN /opt/conda/bin/python -m pip install --no-cache-dir --upgrade 'urllib3>=2.8.0' && \
+    /opt/conda/envs/ptca/bin/python -m pip install --no-cache-dir --upgrade 'oauthlib>=4.0.0'

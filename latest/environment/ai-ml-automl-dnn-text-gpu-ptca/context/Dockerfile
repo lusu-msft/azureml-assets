@@ -1,7 +1,8 @@
-FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202609.1
+FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202610.2
 
 USER root:root
 
+# Upgrade Ubuntu security fixes inherited from the ACPT base image.
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
@@ -26,10 +27,10 @@ RUN pip install \
     accelerate==1.12.0 \
     deepspeed~=0.15.1
 
-# Override transformers to fix GHSA-69w3-r845-3855
-# Root cause: azureml-automl-dnn-nlp==1.62.0 is the latest release as of
-# 2026-05-26 and pins transformers==4.53.0, so direct override is required.
-RUN pip install --no-cache-dir --no-deps 'transformers[sentencepiece,torch]==5.5.4'
+# Override transformers to fix GHSA-69w3-r845-3855 and GHSA-xrqw-3rrv-vx5w.
+# Root cause: azureml-automl-dnn-nlp pins transformers below the patched
+# version, so direct override is required.
+RUN pip install --no-cache-dir --no-deps 'transformers[sentencepiece,torch]==5.10.0'
 
 # Vulnerability patches for ptca environment (python 3.10 at /opt/conda/envs/ptca)
 # pip -> >=26.1.2 (GHSA-jp4c-xjxw-mgf9, CVE-2026-6357,
@@ -39,8 +40,6 @@ RUN pip install --no-cache-dir --no-deps 'transformers[sentencepiece,torch]==5.5
 #   re-flag them.
 # setuptools 81.0.0 -> >=83.0.0 (GHSA-h35f-9h28-mq5c, GHSA-58pv-8j8x-9vj2):
 #   setuptools is a build dependency with no parent that pins it.
-# torch 2.8.0+cu126 -> >=2.10.0 (GHSA-vgrw-7cvw-pwgx, GHSA-qfhq-4f3w-5fph):
-#   inherited from the ACPT base image ptca conda environment.
 # numpy<2 is NOT a security floor: onnx pulls ml_dtypes, which as of 0.6.0 requires
 #   numpy>=2.0.0. Without this cap pip silently upgrades numpy to 2.x, leaving the
 #   prebuilt pandas wheel binary-incompatible so the image fails on import pandas with
@@ -69,12 +68,14 @@ RUN pip install --no-cache-dir --no-deps 'transformers[sentencepiece,torch]==5.5
 RUN conda install -p /opt/conda/envs/ptca -c conda-forge -y 'pip>=26.1.2' && \
     /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade \
     'setuptools>=83.0.0' \
-    'torch>=2.10.0' \
+    'msgpack>=1.2.1' \
     'numpy<2' \
     'onnx>=1.21.0' \
     'bokeh>=3.8.2' \
     'distributed>=2026.1.0' \
     'aiohttp>=3.14.0' \
+    'httpx<1' \
+    'huggingface-hub>=1.5.0,<2.0' \
     'pyarrow>=23.0.1' \
     'cryptography>=50.0.0' \
     'GitPython>=3.1.57' \
@@ -124,6 +125,7 @@ RUN /opt/conda/bin/pip install --no-cache-dir --upgrade \
     'setuptools>=83.0.0' \
     'python-dotenv>=1.2.2' \
     'aiohttp>=3.14.0' \
+    'anyio>=4.14.2' \
     'PyJWT>=2.13.0' \
     'py-rattler>=0.24.0' \
     'cryptography>=50.0.0' \
@@ -136,13 +138,55 @@ RUN /opt/conda/bin/pip install --no-cache-dir --upgrade \
            /opt/conda/pkgs/msgpack-1.1.2-* \
            /opt/conda/pkgs/setuptools-70.3.0-*
 
-# Remove stale vendored metadata that scanners otherwise report as installed packages.
+# Temporary override for the Torch stack inherited from the ACPT torch280 base.
+# The CUDA 12.6 index has no torchaudio build compatible with torch>=2.12, so
+# remove inherited torchaudio rather than retaining a binary-incompatible build.
+# Remove when the base provides torch>=2.13.0 and compatible companion packages.
+RUN /opt/conda/envs/ptca/bin/pip uninstall -y torchaudio && \
+    /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade \
+        --index-url https://download.pytorch.org/whl/cu126 \
+        'torch==2.13.0' 'torchvision==0.28.0' && \
+    /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade --no-deps \
+        'setuptools>=83.0.0' 'huggingface-hub==1.33.0' 'tokenizers==0.22.2'
+
+# pip 26.2.1's vendor inventories report its private setuptools 70.3.0 and
+# msgpack 1.1.2 copies as pathless packages. Remove generated pip vendor
+# CycloneDX inventories and matching stale entries, then fail if any remain.
+RUN set -eu; \
+    set -- /opt/conda; \
+    if test -d /azureml-envs; then set -- "$@" /azureml-envs; fi; \
+    find "$@" -type f \
+        -path '*/site-packages/pip/_vendor/bom.cdx.json' -delete; \
+    find "$@" -type f -path '*/pip/_vendor/vendor.txt' \
+        -exec sed -i '/^setuptools==70\.3\.0$/d; /^msgpack==1\.1\.2$/d' {} +; \
+    for python in /opt/conda/bin/python /opt/conda/envs/*/bin/python /azureml-envs/*/bin/python; do \
+        test -x "$python" || continue; \
+        site_packages="$("$python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"; \
+        find "$site_packages" -type f \( \
+            -path '*/pip-*.dist-info/sboms/bom.cdx.json' -o \
+            -path '*/virtualenv-*.dist-info/sboms/*.json' \
+        \) -exec grep -IlE 'pkg:pypi/(setuptools@70\.3\.0|msgpack@1\.1\.2)(["?#]|$)' {} + | \
+            while IFS= read -r inventory; do rm -f "$inventory"; done; \
+        if find "$site_packages" -type f \( \
+            -path '*/pip-*.dist-info/sboms/bom.cdx.json' -o \
+            -path '*/virtualenv-*.dist-info/sboms/*.json' \
+        \) -exec grep -IlE 'pkg:pypi/(setuptools@70\.3\.0|msgpack@1\.1\.2)(["?#]|$)' {} + | grep -q .; then exit 1; fi; \
+    done; \
+    if find "$@" -type f \
+        -path '*/site-packages/pip/_vendor/bom.cdx.json' | grep -q .; then exit 1; fi; \
+    if find "$@" -type f -path '*/pip/_vendor/vendor.txt' \
+        -exec grep -IlE '^(setuptools==70\.3\.0|msgpack==1\.1\.2)$' {} + | grep -q .; then exit 1; fi
+
+# Refresh packages for the latest Ubuntu security advisories.
 RUN set -eux; \
-    find /opt /root /tmp -path '*/pip/_vendor/bom.cdx.json' -type f -delete; \
-    find /opt /root /tmp -path '*/_vendor/vendor.txt' -type f -exec \
-        sed -i -E 's/setuptools==70\.3\.0/setuptools==83.0.0/g; s/msgpack==1\.1\.2/msgpack==1.2.1/g' {} +; \
-    for metadata in $(find /opt /root /tmp -type f \( -name METADATA -o -name PKG-INFO \) 2>/dev/null); do \
-        if grep -Eq '^Name: (setuptools|msgpack)$' "$metadata" && grep -Eq '^Version: (70\.3\.0|1\.1\.2)$' "$metadata"; then \
-            rm -rf "$(dirname "$metadata")"; \
+    apt-get update; \
+    security_packages="libssl-dev libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
         fi; \
-    done
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*

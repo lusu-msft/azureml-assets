@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202609.1
+FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202610.2
 
 ENV AZUREML_CONDA_ENVIRONMENT_PATH=/azureml-envs/azureml-automl-dnn-text-gpu
 ENV PATH=$AZUREML_CONDA_ENVIRONMENT_PATH/bin:$PATH
@@ -28,14 +28,21 @@ RUN apt-get update && \
         runit \
         unzip && \
     apt-get install -y --only-upgrade \
+        coreutils \
+        diffutils \
         libc-bin \
         libc-dev-bin \
         libc6 \
         libc6-dev \
+        libattr1 \
+        libevent-core-2.1-7 \
+        libgcrypt20 \
         libpam-modules \
         libpam-modules-bin \
         libpam-runtime \
         libpam0g \
+        libp11-kit0 \
+        libssh-4 \
         locales \
         rsyslog && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
@@ -93,16 +100,13 @@ RUN pip install --no-cache-dir \
                 azureml-automl-dnn-nlp==1.62.0
 
 # Separate updates for fixing vulnerabilities.
-# Doing it  separately from pip install above to avoid conflict with other packages
-# We should aim for this list to be empty with new and patched releases
-# by fixing dependencies in the base packages
+# Keep this list small; prefer fixed parent packages when available.
 RUN pip install pyarrow==14.0.2 \
                 accelerate==1.12.0 
 
-# Override transformers to fix GHSA-69w3-r845-3855
-# Root cause: azureml-automl-dnn-nlp==1.62.0 (latest as of 2026-05-26)
-# pins transformers==4.53.0; cannot upgrade parent.
-RUN pip install --no-cache-dir --no-deps 'transformers[sentencepiece,torch]==5.5.4'
+# transformers is a pinned transitive dep of azureml-automl-dnn-nlp; fixes GHSA-69w3-r845-3855 and GHSA-xrqw-3rrv-vx5w.
+RUN pip install --no-cache-dir --no-deps 'transformers[sentencepiece,torch]==5.10.0'
+RUN pip install --no-cache-dir 'httpx<1' 'huggingface-hub>=1.5.0,<2.0'
 
 # Security: upgrade pip to fix self-update vulnerabilities in the AzureML conda env.
 # pip is its own parent, so explicit upgrade is the only remediation.
@@ -129,19 +133,29 @@ RUN pip install --no-cache-dir --upgrade 'aiohttp>=3.14.3'
 
 # The ACPT ptca env and the base conda prefix carry their own copies of these
 # packages, which the AzureML conda env above never touches; patch them explicitly.
-RUN /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade 'aiohttp>=3.14.3'
-RUN /opt/conda/bin/pip install --no-cache-dir --upgrade 'aiohttp>=3.14.3' 'cryptography>=50.0.0'
+RUN /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade 'aiohttp>=3.14.3' 'httpx<1' 'huggingface-hub>=1.5.0,<2.0'
+RUN /opt/conda/bin/pip install --no-cache-dir --upgrade 'aiohttp>=3.14.3' 'anyio>=4.14.2' 'cryptography>=50.0.0'
 
-# torch is pinned by the ACPT base image in the ptca env and by
-# azureml-automl-dnn-nlp in this AzureML env; upgrade both for GHSA-rrmf-rvhw-rf47,
-# GHSA-vgrw-7cvw-pwgx, and GHSA-qfhq-4f3w-5fph while keeping CUDA 12.6 wheels.
-RUN pip install --no-cache-dir --upgrade --index-url https://download.pytorch.org/whl/cu126 'torch==2.13.0+cu126'
-RUN /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade --index-url https://download.pytorch.org/whl/cu126 'torch==2.13.0+cu126'
-RUN /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade 'setuptools>=83.0.0'
+RUN /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade 'setuptools>=83.0.0' 'msgpack>=1.2.1'
 
-# Apply the same setuptools security fix in the AzureML and base conda envs.
-RUN pip install --no-cache-dir --force-reinstall --no-deps 'setuptools==83.0.0'
-RUN /opt/conda/bin/pip install --no-cache-dir --upgrade 'setuptools>=83.0.0'
+# Apply the same setuptools and msgpack security fixes in the AzureML and base conda envs.
+RUN pip install --no-cache-dir --force-reinstall --no-deps 'setuptools==83.0.0' 'msgpack>=1.2.1'
+RUN /opt/conda/bin/pip install --no-cache-dir --upgrade 'setuptools>=83.0.0' 'msgpack>=1.2.1'
+
+# Temporary override for the Torch stack inherited from the ACPT torch280 base.
+# The CUDA 12.6 index has no torchaudio build compatible with torch>=2.12, so
+# remove inherited torchaudio rather than retaining a binary-incompatible build.
+# Remove when the base provides torch>=2.13.0 and compatible companion packages.
+RUN /opt/conda/envs/ptca/bin/pip uninstall -y torchaudio && \
+    /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade \
+        --index-url https://download.pytorch.org/whl/cu126 \
+        'torch==2.13.0' 'torchvision==0.28.0' && \
+    /opt/conda/envs/ptca/bin/pip install --no-cache-dir --upgrade --no-deps \
+        'setuptools>=83.0.0' 'huggingface-hub==1.33.0' 'tokenizers==0.22.2' && \
+    "$AZUREML_CONDA_ENVIRONMENT_PATH/bin/pip" uninstall -y torchaudio && \
+    "$AZUREML_CONDA_ENVIRONMENT_PATH/bin/pip" install --no-cache-dir --upgrade \
+        --index-url https://download.pytorch.org/whl/cu126 \
+        'torch==2.13.0' 'torchvision==0.28.0'
 
 RUN /bin/bash -c "source activate $AZUREML_CONDA_ENVIRONMENT_PATH && \
  export CUDACXX=/usr/local/cuda/bin/nvcc && \
@@ -150,15 +164,54 @@ RUN /bin/bash -c "source activate $AZUREML_CONDA_ENVIRONMENT_PATH && \
  HOROVOD_CUDA_HOME=/usr/local/cuda \
  CMAKE_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda-12.6/targets/x86_64-linux/lib \
  pip install --no-cache-dir --no-build-isolation \
- git+https://github.com/horovod/horovod@3a31d933a13c7c885b8a673f4172b17914ad334d"
+ git+https://github.com/horovod/horovod@3a31d933a13c7c885b8a673f4172b17914ad334d && \
+ pip install --no-cache-dir --upgrade --no-deps 'setuptools>=83.0.0' 'huggingface-hub==1.33.0' 'tokenizers==0.22.2'"
 
 RUN rm -rf /opt/conda/pkgs/
 
-# Remove stale pip vendored dependency metadata that scanners otherwise report
-# as setuptools 70.3.0 and msgpack 1.1.2 after the real packages are patched.
-RUN set -eux; \
-    find / -xdev -path '*/site-packages/pip/_vendor/bom.cdx.json' -type f -delete; \
-    find /opt /azureml-envs /root -type d \( -name 'setuptools-70.3.0.dist-info' -o -name 'msgpack-1.1.2.dist-info' \) -prune -exec rm -rf {} +; \
-    find /opt /azureml-envs /root -path '*/_vendor/vendor.txt' -type f -exec \
-        sed -i -E 's/setuptools==70\.3\.0/setuptools==83.0.0/g; s/msgpack==1\.1\.2/msgpack==1.2.1/g' {} +
+# pip 26.2.1's vendor inventories report its private setuptools 70.3.0 and
+# msgpack 1.1.2 copies as pathless packages. Remove generated pip vendor
+# CycloneDX inventories and matching stale entries, then fail if any remain.
+RUN set -eu; \
+    set -- /opt/conda; \
+    if test -d /azureml-envs; then set -- "$@" /azureml-envs; fi; \
+    find "$@" -type f \
+        -path '*/site-packages/pip/_vendor/bom.cdx.json' -delete; \
+    find "$@" -type f -path '*/pip/_vendor/vendor.txt' \
+        -exec sed -i '/^setuptools==70\.3\.0$/d; /^msgpack==1\.1\.2$/d' {} +; \
+    for python in /opt/conda/bin/python /opt/conda/envs/*/bin/python /azureml-envs/*/bin/python; do \
+        test -x "$python" || continue; \
+        site_packages="$("$python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"; \
+        find "$site_packages" -type f \( \
+            -path '*/pip-*.dist-info/sboms/bom.cdx.json' -o \
+            -path '*/virtualenv-*.dist-info/sboms/*.json' \
+        \) -exec grep -IlE 'pkg:pypi/(setuptools@70\.3\.0|msgpack@1\.1\.2)(["?#]|$)' {} + | \
+            while IFS= read -r inventory; do rm -f "$inventory"; done; \
+        if find "$site_packages" -type f \( \
+            -path '*/pip-*.dist-info/sboms/bom.cdx.json' -o \
+            -path '*/virtualenv-*.dist-info/sboms/*.json' \
+        \) -exec grep -IlE 'pkg:pypi/(setuptools@70\.3\.0|msgpack@1\.1\.2)(["?#]|$)' {} + | grep -q .; then exit 1; fi; \
+    done; \
+    if find "$@" -type f \
+        -path '*/site-packages/pip/_vendor/bom.cdx.json' | grep -q .; then exit 1; fi; \
+    if find "$@" -type f -path '*/pip/_vendor/vendor.txt' \
+        -exec grep -IlE '^(setuptools==70\.3\.0|msgpack==1\.1\.2)$' {} + | grep -q .; then exit 1; fi
 # end pip install
+
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="libssl-dev libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Reassert newly patched transitive dependencies after all package installs.
+RUN /azureml-envs/azureml-automl-dnn-text-gpu/bin/python -m pip install --no-cache-dir --upgrade 'urllib3>=2.8.0' && \
+    /opt/conda/bin/python -m pip install --no-cache-dir --upgrade 'PyJWT>=2.15.0' 'urllib3>=2.8.0'

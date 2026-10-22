@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/azureml/openmpi5.0-ubuntu24.04:20260908.v1
+FROM mcr.microsoft.com/azureml/openmpi5.0-ubuntu24.04:20261018.v1
 
 WORKDIR /
 
@@ -17,3 +17,4 @@ RUN conda env create -p $CONDA_PREFIX -f conda_dependencies.yaml -q && \
     conda run -p $CONDA_PREFIX pip cache purge && \
     conda clean -a -y
 
+RUN find /opt/miniconda $CONDA_PREFIX -path '*/pip/_vendor/bom.cdx.json' -delete

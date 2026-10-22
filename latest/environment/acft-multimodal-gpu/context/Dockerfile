@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202609.1
+FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202610.2
 
 USER root
 # Apply Ubuntu security updates, including inherited base-image packages with
@@ -21,7 +21,17 @@ RUN apt-get -y update && apt-get -y upgrade && \
         openssl \
         libudev1 \
         udev \
-        libsystemd0 && \
+        libsystemd0 \
+        libc-bin \
+        libc6 \
+        locales \
+        python3.10 \
+        python3.10-minimal \
+        libpython3.10-minimal \
+        libpython3.10-stdlib \
+        openssh-client \
+        libgcrypt20 \
+        libevent-core-2.1-7 && \
     apt-get -y purge 'linux-headers-*' 'linux-libc-dev' && \
     apt-get -y autoremove && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -80,7 +90,7 @@ RUN pip install --no-cache-dir --upgrade 'setuptools>=84.0.0' 'nltk>=3.10.0' 'tr
 RUN conda run -n base python -m pip install --no-cache-dir --upgrade \
     'setuptools>=84.0.0' 'pyOpenSSL>=26.0.0' 'urllib3>=2.7.0' \
     'python-dotenv>=1.2.2' 'pip>=26.1.1' 'idna>=3.15' 'click>=8.3.3' \
-    'aiohttp>=3.14.3' 'PyJWT>=2.13.0' 'pydantic-settings>=2.14.2' \
+    'aiohttp>=3.14.3' 'anyio>=4.14.2' 'PyJWT>=2.13.0' 'pydantic-settings>=2.14.2' \
     'msgpack>=1.2.1' 'pillow>=12.3.0' 'py-rattler>=0.24.0' \
     'cryptography>=50.0.0' && \
     rm -f /opt/conda/conda-meta/setuptools-70*.json \
@@ -124,3 +134,17 @@ RUN conda run -n ptca pip install --no-cache-dir --upgrade \
     conda run -n ptca pip install --no-cache-dir --upgrade \
     --index-url https://download.pytorch.org/whl/cu126 \
     'torch==2.13.0+cu126' 'torchvision==0.28.0+cu126'
+
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="libssl-dev libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*

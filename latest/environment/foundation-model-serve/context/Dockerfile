@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/azureml/openmpi5.0-cuda13.1-ubuntu24.04:20260908.v1
+FROM mcr.microsoft.com/azureml/openmpi5.0-cuda13.1-ubuntu24.04:20261018.v1
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -21,6 +21,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/nvidia/lib:/usr/local/nvid
 # git is needed by some pip editable installs / VCS deps.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git && \
+    apt-get install -y --only-upgrade linux-libc-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Create the AzureML-conventional conda environment so app deps stay isolated from the

@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202609.1
+FROM mcr.microsoft.com/aifx/acpt/stable-ubuntu2204-cu126-py310-torch280:biweekly.202610.2
 
 USER root
 
@@ -10,18 +10,18 @@ RUN apt-get update && apt-get -y upgrade && \
       dotnet-hostfxr-8.0 \
       dotnet-host-8.0 \
       dotnet-runtime-8.0 \
-      libgssapi-krb5-2=1.19.2-2ubuntu0.8 \
-      libk5crypto3=1.19.2-2ubuntu0.8 \
-      libkrb5-3=1.19.2-2ubuntu0.8 \
-      libkrb5support0=1.19.2-2ubuntu0.8 \
+      libgssapi-krb5-2 \
+      libk5crypto3 \
+      libkrb5-3 \
+      libkrb5support0 \
       libcurl3-gnutls \
       libcurl4 \
       libgcrypt20 \
       libnghttp2-14 \
       liblzma5 \
-      libsqlite3-0=3.37.2-2ubuntu0.7 \
-      tar=1.34+dfsg-1ubuntu0.1.22.04.6 \
-      wget=1.21.2-2ubuntu1.5 \
+      libsqlite3-0 \
+      tar \
+      wget \
       xz-utils && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -37,7 +37,7 @@ RUN pip install -r requirements.txt --no-cache-dir
 # sqlparse is a transitive dependency of mlflow; pin to >=0.6.0 for GHSA-f2ff-p2ww-7p4p,
 # GHSA-prg7-hcfm-mfcr, GHSA-3496-9g83-7v6x, and GHSA-pwgv-4x5q-6m9f.
 RUN pip install --no-cache-dir mlflow==3.15.0 'sqlparse>=0.6.0'
-RUN pip install nltk==3.10.0 --no-cache-dir
+RUN pip install nltk==3.10.3 --no-cache-dir
 RUN python -m nltk.downloader punkt
 RUN python -m nltk.downloader punkt_tab
 RUN MAX_JOBS=$(nproc) pip install --no-cache-dir --upgrade flash-attn==2.8.3 --no-build-isolation
@@ -73,8 +73,8 @@ RUN conda install -n base -c conda-forge --no-deps -y 'setuptools>=83.0.0' && \
            /opt/conda/envs/*/lib/python*/site-packages/pip/_vendor/bom.cdx.json \
            /opt/conda/envs/*/lib/python*/site-packages/pip/_vendor/vendor.txt
 
-# msgpack is inherited from the ACPT base image in the base conda env; override to fix GHSA-6v7p-g79w-8964.
-RUN /opt/conda/bin/python -m pip install --upgrade --no-cache-dir 'msgpack>=1.2.1' && \
+# msgpack and anyio are inherited by the base conda env; override their vulnerable versions.
+RUN /opt/conda/bin/python -m pip install --upgrade --no-cache-dir 'msgpack>=1.2.1' 'anyio>=4.14.2' && \
     rm -rf /opt/conda/lib/python*/site-packages/msgpack-1.1*.dist-info
 
 # aiohttp and cryptography are inherited from the ACPT base image in the base and ptca conda envs.
@@ -91,3 +91,21 @@ RUN conda run -n ptca python -m pip install --upgrade --no-cache-dir \
 # clean conda and pip caches
 RUN rm -rf ~/.cache/pip
 RUN conda clean -a -y && rm -rf /opt/miniconda/pkgs/
+
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="libevent-core-2.1-7 libssl-dev libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Reassert newly patched transitive dependencies after all package installs.
+RUN /opt/conda/bin/python -m pip install --no-cache-dir --upgrade 'PyJWT>=2.15.0' 'urllib3>=2.8.0' && \
+    /opt/conda/envs/ptca/bin/python -m pip install --no-cache-dir --upgrade 'oauthlib>=4.0.0'

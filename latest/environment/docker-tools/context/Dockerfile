@@ -1,8 +1,8 @@
-# Shared Go toolchain version used across builder stages; compiled from source so the
-# trivy and oras binaries link a patched Go stdlib. Bump to the latest patched Go.
-ARG GO_VERSION=1.26.8
-ARG TRIVY_VERSION=0.74.0
-ARG ORAS_VERSION=1.3.4
+# Build ORAS and Trivy with the latest patched Go release, including the
+# crypto/x509 security fixes in Go 1.27.3.
+ARG GO_VERSION=1.27.3
+ARG TRIVY_VERSION=0.76.0
+ARG ORAS_VERSION=1.3.5
 
 # Mode toggles: "build" (compile from source with patched Go + deps) or
 # "install" (download the upstream release binary). Both default to "build"
@@ -60,9 +60,8 @@ FROM oras-${ORAS_MODE} AS oras-final
 # =========================================
 # Builder: compile Trivy with patched Go + deps
 # =========================================
-# Build Trivy from source so it links a patched Go stdlib (GO_VERSION). Prefer bumping
-# TRIVY_VERSION to the latest release (its go.mod carries fixed modules) over hand-pinning
-# deps; add a `go get pkg@version` below only for a module the latest release still lags.
+# Build Trivy from source so it links a patched Go stdlib (GO_VERSION).
+# The selected release already carries the required module security fixes.
 FROM ubuntu:24.04 AS trivy-build
 ARG GO_VERSION
 ARG TRIVY_VERSION
@@ -75,11 +74,6 @@ RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go
  && rm /tmp/go.tar.gz
 ENV PATH=/usr/local/go/bin:$PATH
 # Build env replicates trivy's magefile (CGO disabled, jsonv2 experiment, version ldflag).
-# No module pins are needed here: trivy v0.74.0's go.mod already carries fixed versions of
-# every dep previously pinned (x/crypto 0.55.0, x/mod 0.40.0, x/net 0.58.0, x/text 0.41.0,
-# grpc 1.82.1, moby/buildkit 0.32.2, oras-go/v2 2.6.2). Add a `go get pkg@version` below
-# only for a module a future tagged release still lags, and drop it once the release
-# catches up.
 RUN git clone --depth 1 --branch v${TRIVY_VERSION} https://github.com/aquasecurity/trivy.git /tmp/trivy \
  && cd /tmp/trivy \
  && CGO_ENABLED=0 GOEXPERIMENT=jsonv2 go build \
@@ -88,7 +82,7 @@ RUN git clone --depth 1 --branch v${TRIVY_VERSION} https://github.com/aquasecuri
  && test -x /out/trivy \
  && /out/trivy --version \
  && echo "--- linked Go module versions (verifying CVE-fix pins) ---" \
- && go version -m /out/trivy | grep -E '(stdlib|oras-go|rekor|golang\.org/x/(crypto|mod|net|text)|in-toto-golang|go-git/v5|go-billy/v5|containerd|grpc|buildkit)' \
+ && go version -m /out/trivy | grep -E '(stdlib|oras-go|rekor|golang\.org/x/(crypto|mod|net|text)|in-toto-golang|go-git/v5|go-billy/v5|containerd|grpc|buildkit|go-openapi/swag/jsonutils)' \
  && rm -rf /tmp/trivy
 
 # =========================================
@@ -116,7 +110,7 @@ FROM trivy-${TRIVY_MODE} AS trivy-final
 # =========================================
 # Runtime: AzureML base + Docker + Trivy + conda
 # =========================================
-FROM mcr.microsoft.com/azureml/openmpi5.0-ubuntu24.04:20260908.v1
+FROM mcr.microsoft.com/azureml/openmpi5.0-ubuntu24.04:20261018.v1
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Docker APT repo + minimal install (no recommends) + cleanup

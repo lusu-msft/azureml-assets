@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 
 import os
+import json
 import logging
 import math
 from typing import Dict, List, Union, Optional, Tuple
@@ -9,10 +10,11 @@ from typing import Dict, List, Union, Optional, Tuple
 from typing_extensions import overload, override
 
 from azure.ai.evaluation._exceptions import EvaluationException, ErrorBlame, ErrorCategory, ErrorTarget
-from azure.ai.evaluation._evaluators._common import PromptyEvaluatorBase
 from azure.ai.evaluation._model_configurations import Conversation
 from azure.ai.evaluation._common._experimental import experimental
 from azure.ai.evaluation._constants import EVALUATION_PASS_FAIL_MAPPING
+
+from azure.ai.evaluation._evaluators import _common as _sdk_common
 
 # ---------------------------------------------------------------------------
 # Imports target azure-ai-evaluation >= 1.18.1. Each ``except ImportError``
@@ -41,7 +43,12 @@ except ImportError:  # azure-ai-evaluation 1.17.x (backward compat; remove when 
             default=-1,
         )
         if latest_user_index == -1:
-            raise ValueError("messages must contain at least one message with role 'user'.")
+            raise EvaluationException(
+                message="messages must contain at least one message with role 'user'.",
+                blame=ErrorBlame.USER_ERROR,
+                category=ErrorCategory.INVALID_VALUE,
+                target=ErrorTarget.COMPLETENESS_EVALUATOR,
+            )
         return messages[: latest_user_index + 1], messages[latest_user_index + 1:]
 
 # Re-exported so the module keeps exposing the message-preprocessing helpers used
@@ -57,11 +64,55 @@ except ImportError:  # azure-ai-evaluation 1.17.x (backward compat; remove when 
         _normalize_function_call_types,
     )
 
+ModelEvaluatorBase = getattr(_sdk_common, "ModelEvaluatorBase", _sdk_common.PromptyEvaluatorBase)
+try:
+    from azure.ai.evaluation._evaluators._common._decision_strategy import DecisionEvaluationStrategy, LikertScoring
+except ImportError as exc:
+    if exc.name != "azure.ai.evaluation._evaluators._common._decision_strategy":
+        raise
+    DecisionEvaluationStrategy = LikertScoring = None
+_SDK_SUPPORTS_DECISION = (
+    hasattr(_sdk_common, "ModelEvaluatorBase") and DecisionEvaluationStrategy is not None and LikertScoring is not None
+)
+
+
+def _load_decision_questions(path: str, question_id: str) -> Dict:
+    """Load the packaged applicability and rating questions without initializing a chat flow."""
+    from azure.ai.evaluation._legacy.prompty._yaml_utils import load_yaml
+
+    rubric = json.loads(json.dumps(load_yaml(path)))
+    return {"status": rubric["status"], question_id: rubric["result"]}
+
+
 logger = logging.getLogger(__name__)
 
 
+def _parse_json_response_if_applicable(response):
+    """Parse ``response`` as JSON when it is a JSON-encoded string of chat messages.
+
+    If ``response`` is a string that successfully parses as JSON into a list, the parsed
+    list is returned so it can be handled by the existing message-list preprocessing path.
+    Any other input (a plain string, an already-parsed list, or a string that fails to
+    parse as JSON) is returned unchanged.
+
+    :param response: The raw response value from the eval input.
+    :type response: Any
+    :return: The parsed list of messages, or the original response if it is not a
+        JSON-encoded list.
+    :rtype: Any
+    """
+    if isinstance(response, str):
+        try:
+            parsed = json.loads(response)
+        except (ValueError, TypeError):
+            return response
+        if isinstance(parsed, list):
+            return parsed
+    return response
+
+
 @experimental
-class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
+class ResponseCompletenessEvaluator(ModelEvaluatorBase[Union[str, float]]):
     """Evaluate the extent to which a response contains necessary and relevant information with respect to truth.
 
     The completeness measure assesses how thoroughly an AI model's generated response aligns with the key information,
@@ -78,7 +129,9 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
     3: Moderately complete — Covers about half of the required content.
     4: Mostly complete — Includes most of the necessary details with minimal omissions.
     5: Fully complete — Contains all key information without any omissions.
-    :param model_config: Configuration for the Azure OpenAI model.
+    :param model_config: Configuration for a chat model, or a mapping with ``type="decision"``,
+        ``azure_endpoint`` and ``azure_deployment`` for a native Decision model.
+        Authenticate with ``api_key`` or ``credential``.
     :type model_config: Union[~azure.ai.evaluation.AzureOpenAIModelConfiguration,
         ~azure.ai.evaluation.OpenAIModelConfiguration]
 
@@ -105,6 +158,8 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
 
     # Constants must be defined within eval's directory to be save/loadable
 
+    _supports_decision_models = True
+    _DECISION_FILE = "response_completeness.decision.yaml"
     _PROMPTY_FILE = "response_completeness.prompty"
     _RESULT_KEY = "response_completeness"
 
@@ -122,7 +177,9 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
     ):
         """Initialize the Response Completeness evaluator.
 
-        :param model_config: Configuration for the Azure OpenAI model.
+        :param model_config: Configuration for a chat model, or a mapping with ``type="decision"``,
+        ``azure_endpoint`` and ``azure_deployment`` for a native Decision model.
+        Authenticate with ``api_key`` or ``credential``.
         :type model_config: Union[~azure.ai.evaluation.AzureOpenAIModelConfiguration,
             ~azure.ai.evaluation.OpenAIModelConfiguration]
         :param threshold: The threshold for evaluation.
@@ -137,6 +194,16 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         threshold_value = kwargs.pop("threshold", threshold)
         higher_is_better_value = kwargs.pop("_higher_is_better", True)
         self.threshold = threshold_value  # to be removed in favor of _threshold
+        self._decision_selected = isinstance(model_config, dict) and model_config.get("type") == "decision"
+        self._strategy = None
+        if self._decision_selected and not _SDK_SUPPORTS_DECISION:
+            raise EvaluationException(
+                message="Decision models require an azure-ai-evaluation version with decision model support.",
+                blame=ErrorBlame.USER_ERROR,
+                category=ErrorCategory.INVALID_VALUE,
+                target=ErrorTarget.COMPLETENESS_EVALUATOR,
+            )
+
         super().__init__(
             model_config=model_config,
             prompty_file=prompty_path,
@@ -145,6 +212,21 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             credential=credential,
             _higher_is_better=higher_is_better_value,
             **kwargs,
+        )
+
+        if self._decision_selected:
+            self._strategy = self._create_decision_strategy(os.path.join(current_dir, self._DECISION_FILE))
+
+    def _create_decision_strategy(self, path: str):
+        """Use the SDK runner and scoring with this asset's packaged rubric."""
+        return DecisionEvaluationStrategy(
+            self._decision_model_runner,
+            result_key=self._result_key,
+            error_target=ErrorTarget.COMPLETENESS_EVALUATOR,
+            questions=_load_decision_questions(path, self._result_key),
+            scoring=LikertScoring(5, minimum=1),
+            threshold=self._threshold,
+            timeout=self._LLM_CALL_TIMEOUT,
         )
 
     @overload
@@ -269,6 +351,8 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
                 target=ErrorTarget.COMPLETENESS_EVALUATOR,
             )
 
+        eval_input["response"] = _parse_json_response_if_applicable(eval_input.get("response"))
+
         if _is_intermediate_response(eval_input.get("response")):
             return self._return_not_applicable_result(
                 "Intermediate response. Please provide the agent's final response for evaluation.",
@@ -279,6 +363,11 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         if isinstance(eval_input.get("query"), list):
             eval_input["query"] = _preprocess_messages(eval_input["query"])
 
+        if self._decision_selected:
+            # The native state is exactly the inputs response_completeness.prompty renders.
+            state = {"response": eval_input["response"], "ground_truth": eval_input["ground_truth"]}
+            return await self._strategy.evaluate(state)
+
         result = await self._flow(timeout=self._LLM_CALL_TIMEOUT, **eval_input)
         llm_output = result.get("llm_output", result) if isinstance(result, dict) else result
 
@@ -288,7 +377,11 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             llm_status = llm_output.get("status", "completed")
             if llm_status == "skipped":
                 reason = llm_output.get("reason", "")
-                return self._return_not_applicable_result(reason, self._threshold)
+                skipped = self._return_not_applicable_result(reason, self._threshold)
+                metadata = self._get_token_metadata(result)
+                skipped[f"{self._result_key}_properties"] = {**(llm_output.get("properties") or {}), **metadata}
+                skipped.update({f"{self._result_key}_{key}": value for key, value in metadata.items()})
+                return skipped
 
             score = float(llm_output.get("score", math.nan))
             reason = llm_output.get("reason", "")
@@ -330,9 +423,20 @@ class ResponseCompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         """
         messages = kwargs.pop("messages", None)
         if messages is not None:
-            query_messages, response_messages = _split_messages_at_latest_user(messages)
+            try:
+                query_messages, response_messages = _split_messages_at_latest_user(messages)
+            except ValueError as exc:
+                raise EvaluationException(
+                    message=str(exc),
+                    blame=ErrorBlame.USER_ERROR,
+                    category=ErrorCategory.INVALID_VALUE,
+                    target=ErrorTarget.COMPLETENESS_EVALUATOR,
+                ) from exc
             kwargs["query"] = query_messages
             kwargs["response"] = response_messages
+
+        if self._decision_selected:
+            return await super()._real_call(**kwargs)
 
         # Convert inputs into list of evaluable inputs.
         try:

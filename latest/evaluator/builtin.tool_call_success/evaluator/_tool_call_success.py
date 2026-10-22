@@ -4,8 +4,9 @@
 import json
 import os
 import logging
+from copy import deepcopy
 from enum import Enum
-from typing import Dict, Union, List, Optional
+from typing import Dict, Union, List, Optional, Tuple
 from typing_extensions import overload, override
 from azure.ai.evaluation._exceptions import (
     EvaluationException,
@@ -13,9 +14,29 @@ from azure.ai.evaluation._exceptions import (
     ErrorCategory,
     ErrorTarget,
 )
-from azure.ai.evaluation._evaluators._common import PromptyEvaluatorBase
+from azure.ai.evaluation._evaluators import _common as _sdk_common
 from azure.ai.evaluation._common._experimental import experimental
 from azure.ai.evaluation._constants import EVALUATION_PASS_FAIL_MAPPING
+from azure.ai.evaluation._common.utils import _format_value
+# ConversationValidator is re-exported for the test suite / capability surface (unused here).
+from azure.ai.evaluation._evaluators._common._validators import (  # noqa: F401
+    ValidatorInterface,
+    ConversationValidator,
+    ToolDefinitionsValidator,
+)
+
+ModelEvaluatorBase = getattr(_sdk_common, "ModelEvaluatorBase", _sdk_common.PromptyEvaluatorBase)
+try:
+    from azure.ai.evaluation._evaluators._common._decision_strategy import BinaryScoring, DecisionEvaluationStrategy
+except ImportError as exc:
+    if exc.name != "azure.ai.evaluation._evaluators._common._decision_strategy":
+        raise
+    BinaryScoring = DecisionEvaluationStrategy = None
+_SDK_SUPPORTS_DECISION = (
+    hasattr(_sdk_common, "ModelEvaluatorBase")
+    and BinaryScoring is not None
+    and callable(getattr(DecisionEvaluationStrategy, "parse", None))
+)
 
 # ---------------------------------------------------------------------------
 # Imports target azure-ai-evaluation >= 1.18.1. Each ``except ImportError``
@@ -26,16 +47,12 @@ from azure.ai.evaluation._constants import EVALUATION_PASS_FAIL_MAPPING
 # supported.
 # ---------------------------------------------------------------------------
 
-from azure.ai.evaluation._common.utils import _format_value
-# ConversationValidator is re-exported for the test suite / capability surface (unused here).
-from azure.ai.evaluation._evaluators._common._validators import (  # noqa: F401
-    ValidatorInterface,
-    ConversationValidator,
-    ToolDefinitionsValidator,
-)
-
 try:  # azure-ai-evaluation >= 1.18.1
-    from azure.ai.evaluation._common.utils import _is_intermediate_response, _preprocess_messages
+    from azure.ai.evaluation._common.utils import (
+        _is_intermediate_response,
+        _preprocess_messages,
+        _split_messages_at_latest_user,
+    )
 except ImportError:  # azure-ai-evaluation 1.17.x (backward compat; remove when 1.17.x is dropped)  # pragma: no cover
     # Bodies below are copied from azure-ai-evaluation 1.18.1. The 1.17.x
     # _base_prompty_eval versions do not normalize openapi_call / openapi_call_output
@@ -62,6 +79,19 @@ except ImportError:  # azure-ai-evaluation 1.17.x (backward compat; remove when 
         messages = _drop_mcp_approval_messages(messages)
         messages = _normalize_function_call_types(messages)
         return messages
+
+    def _split_messages_at_latest_user(messages: List[dict]) -> Tuple[List[dict], List[dict]]:
+        latest_user_index = max(
+            (index for index, message in enumerate(messages) if message.get("role") == "user"), default=-1
+        )
+        if latest_user_index == -1:
+            raise EvaluationException(
+                message="messages must contain at least one message with role 'user'.",
+                blame=ErrorBlame.USER_ERROR,
+                category=ErrorCategory.INVALID_VALUE,
+                target=ExtendedErrorTarget.TOOL_CALL_SUCCESS_EVALUATOR,
+            )
+        return messages[: latest_user_index + 1], messages[latest_user_index + 1:]
 
 # Re-exported so the module keeps exposing the message-preprocessing helpers used
 # by the test suite; they are invoked indirectly through _preprocess_messages.
@@ -357,8 +387,16 @@ def _create_extended_error_target():
 ExtendedErrorTarget = _create_extended_error_target()
 
 
+def _load_decision_questions(path: str, question_id: str) -> Dict:
+    """Load this independently packaged evaluator's applicability and scoring questions."""
+    from azure.ai.evaluation._legacy.prompty._yaml_utils import load_yaml
+
+    rubric = json.loads(json.dumps(load_yaml(path)))
+    return {"status": rubric["status"], question_id: rubric["result"]}
+
+
 @experimental
-class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
+class ToolCallSuccessEvaluator(ModelEvaluatorBase[Union[str, float]]):
     """The Tool Call Success evaluator determines whether tool calls done by an AI agent includes failures or not.
 
     This evaluator focuses solely on tool call results and tool definitions, disregarding user's query to
@@ -397,6 +435,9 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
 
     """
 
+    _supports_decision_models = True
+    _binary_decision = True
+    _DECISION_FILE = "tool_call_success.decision.yaml"
     _PROMPTY_FILE = "tool_call_success.prompty"
     _RESULT_KEY = "tool_call_success"
     _OPTIONAL_PARAMS = ["tool_definitions"]
@@ -407,8 +448,14 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
     """Evaluator identifier, experimental and to be used only with evaluation in cloud."""
 
     @override
-    def __init__(self, model_config, *, credential=None, **kwargs):
-        """Initialize the Tool Call Success evaluator."""
+    def __init__(self, model_config, *, credential=None, probability_threshold=None, **kwargs):
+        """Initialize the Tool Call Success evaluator.
+
+        :keyword probability_threshold: Decision-only probability cutoff in [0, 1].
+            Overrides model_config["probability_threshold"] without mutating the configuration.
+            The default is 0.75; applicability uses a separate fixed cutoff of 0.5.
+        :paramtype probability_threshold: Optional[float]
+        """
         current_dir = os.path.dirname(__file__)
         prompty_path = os.path.join(current_dir, self._PROMPTY_FILE)
         threshold_value = kwargs.pop("threshold", 1)
@@ -437,6 +484,24 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             )
         ]
 
+        decision_selected = isinstance(model_config, dict) and model_config.get("type") == "decision"
+        if probability_threshold is not None:
+            if not decision_selected:
+                raise EvaluationException(
+                    message="probability_threshold is only supported for Decision models.",
+                    blame=ErrorBlame.USER_ERROR,
+                    category=ErrorCategory.INVALID_VALUE,
+                    target=ExtendedErrorTarget.TOOL_CALL_SUCCESS_EVALUATOR,
+                )
+            model_config = {**model_config, "probability_threshold": probability_threshold}
+        if decision_selected and not _SDK_SUPPORTS_DECISION:
+            raise EvaluationException(
+                message="Decision models require an azure-ai-evaluation version with decision model support.",
+                blame=ErrorBlame.USER_ERROR,
+                category=ErrorCategory.INVALID_VALUE,
+                target=ExtendedErrorTarget.TOOL_CALL_SUCCESS_EVALUATOR,
+            )
+
         super().__init__(
             model_config=model_config,
             prompty_file=prompty_path,
@@ -447,6 +512,19 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             **kwargs,
         )
 
+        self._decision_strategy = None
+        if decision_selected:
+            runner = self._decision_model_runner
+            self._decision_strategy = DecisionEvaluationStrategy(
+                runner,
+                result_key=self._result_key,
+                error_target=ExtendedErrorTarget.TOOL_CALL_SUCCESS_EVALUATOR,
+                questions=_load_decision_questions(os.path.join(current_dir, self._DECISION_FILE), self._result_key),
+                scoring=BinaryScoring(runner.probability_threshold),
+                threshold=self._threshold,
+                timeout=self._LLM_CALL_TIMEOUT,
+            )
+
     @override
     async def _real_call(self, **kwargs):
         """Perform asynchronous call where real end-to-end evaluation logic is executed.
@@ -456,6 +534,18 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         :return: The evaluation result.
         :rtype: Union[DoEvalResult[T_EvalValue], AggregateResult[T_EvalValue]]
         """
+        messages = kwargs.pop("messages", None)
+        if messages is not None:
+            try:
+                kwargs["query"], kwargs["response"] = _split_messages_at_latest_user(messages)
+            except ValueError as exc:
+                raise EvaluationException(
+                    message=str(exc),
+                    blame=ErrorBlame.USER_ERROR,
+                    category=ErrorCategory.INVALID_VALUE,
+                    target=ExtendedErrorTarget.TOOL_CALL_SUCCESS_EVALUATOR,
+                ) from exc
+
         self._validator.validate_eval_input(kwargs)
         return await self._the_super_real_call(**kwargs)
 
@@ -467,6 +557,9 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         :return: The evaluation result.
         :rtype: Union[DoEvalResult[T_EvalValue], AggregateResult[T_EvalValue]]
         """
+        if self._decision_strategy is not None:
+            return await super()._real_call(**kwargs)
+
         # Convert inputs into list of evaluable inputs.
         try:
             eval_input_list = self._convert_kwargs_to_eval_input(**kwargs)
@@ -693,7 +786,7 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             )
 
         if isinstance(eval_input.get("response"), list):
-            eval_input["response"] = _preprocess_messages(eval_input["response"])
+            eval_input["response"] = _preprocess_messages(deepcopy(eval_input["response"]))
             # Short-circuit: when the runtime explicitly marks any tool_call or
             # tool_result with a non-success status (e.g. ``failed`` or
             # ``incomplete``) there is no point asking the LLM judge to
@@ -719,7 +812,7 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             )
 
         if isinstance(eval_input.get("query"), list):
-            eval_input["query"] = _preprocess_messages(eval_input["query"])
+            eval_input["query"] = _preprocess_messages(deepcopy(eval_input["query"]))
 
         # If tool definitions are string, pass directly without reformatting, else format it.
         if "tool_definitions" in eval_input and not isinstance(
@@ -737,6 +830,14 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
                 tool_definitions, logger
             )
 
+        if self._decision_strategy is not None:
+            # The prompty renders only the prepared tool calls and, when supplied, the tool
+            # definitions, so the native request carries exactly those inputs.
+            state = {"tool_calls": eval_input["tool_calls"]}
+            if eval_input.get("tool_definitions") is not None:
+                state["tool_definitions"] = eval_input["tool_definitions"]
+            return await self._decision_strategy.evaluate(state)
+
         prompty_output_dict = await self._flow(
             timeout=self._LLM_CALL_TIMEOUT, **eval_input
         )
@@ -747,7 +848,13 @@ class ToolCallSuccessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
             llm_status = llm_output.get("status", "completed")
             if llm_status == "skipped":
                 reason = llm_output.get("reason", "")
-                return self._return_not_applicable_result(reason, self._threshold)
+                result = self._return_not_applicable_result(reason, self._threshold)
+                token_metadata = self._get_token_metadata(prompty_output_dict)
+                result[f"{self._result_key}_properties"] = {
+                    **(llm_output.get("properties", {}) or {}), **token_metadata,
+                }
+                result.update({f"{self._result_key}_{key}": value for key, value in token_metadata.items()})
+                return result
 
             llm_properties = llm_output.get("properties", {}) or {}
 

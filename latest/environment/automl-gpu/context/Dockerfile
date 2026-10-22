@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/azureml/openmpi5.0-cuda12.4-ubuntu22.04:20260908.v1
+FROM mcr.microsoft.com/azureml/openmpi5.0-cuda12.4-ubuntu22.04:20261018.v1
 
 ENV AZUREML_CONDA_ENVIRONMENT_PATH /azureml-envs/automl
 ENV PATH $AZUREML_CONDA_ENVIRONMENT_PATH/bin:$PATH
@@ -22,12 +22,10 @@ RUN /opt/miniconda/bin/python -m pip install --upgrade --no-cache-dir 'cryptogra
     'bokeh>=3.8.2' \
     'onnx>=1.21.0' \
     'pyarrow==23.0.1' \
+    'numpy>=1.23.5,<1.24' \
     'torch==2.13.0' \
     'msgpack>=1.2.1' \
     'sqlparse>=0.6.0' && \
-    rm -rf $AZUREML_CONDA_ENVIRONMENT_PATH/lib/python3.10/site-packages/pip-26.1.1.dist-info && \
-    rm -f $AZUREML_CONDA_ENVIRONMENT_PATH/lib/python3.10/site-packages/pip/_vendor/bom.cdx.json \
-        $AZUREML_CONDA_ENVIRONMENT_PATH/lib/python3.10/site-packages/pip/_vendor/vendor.txt && \
     conda run -p $AZUREML_CONDA_ENVIRONMENT_PATH pip cache purge && \
     conda clean -a -y
 
@@ -37,9 +35,13 @@ ENV MLFLOW_MODEL_FOLDER="mlflow-model"
 
 ENV ENABLE_METADATA=true
 
+# Upgrade vulnerable OS packages inherited from the base image.
 RUN apt-get update && \
     apt-get install --only-upgrade -y --no-install-recommends \
         tar \
+        libexpat1 \
+        libglib2.0-0 \
+        libglib2.0-data \
         libxml2 \
         curl \
         libcurl3-gnutls \
@@ -63,6 +65,7 @@ RUN apt-get update && \
         libpam-modules \
         libpam-modules-bin \
         libssl3 \
+        libgcrypt20=1.9.4-3ubuntu3.3 \
         openssl \
         libperl5.34 \
         perl \
@@ -79,3 +82,24 @@ RUN rm -rf /opt/miniconda/pkgs/
 
 # Avoid ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.29' not found
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$AZUREML_CONDA_ENVIRONMENT_PATH/lib
+
+# Normalize pip's vendored inventory after the corresponding packages are upgraded.
+RUN find /opt /azureml-envs /root -path '*/pip/_vendor/vendor.txt' -type f -exec \
+        sed -i -E 's/setuptools==70\.3\.0/setuptools==83.0.0/g; s/msgpack==1\.1\.2/msgpack==1.2.1/g' {} + && \
+    find /opt /azureml-envs /root -path '*/pip/_vendor/bom.cdx.json' -type f -delete
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="libssl3 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Reassert newly patched transitive dependencies after all package installs.
+RUN /opt/miniconda/bin/python -m pip install --no-cache-dir --upgrade 'PyJWT>=2.15.0'

@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/azureml/openmpi5.0-ubuntu24.04:20260908.v1
+FROM mcr.microsoft.com/azureml/openmpi5.0-ubuntu24.04:20261018.v1
 
 USER root
 
@@ -14,23 +14,46 @@ RUN apt-get update && ACCEPT_EULA=Y apt-get -y upgrade && \
 apt-get install -y sudo locales libssl-dev sqlite3 && \
 apt-get install -y --only-upgrade \
     curl \
+    gir1.2-glib-2.0 \
     gzip \
+    libc-bin \
+    libc-dev-bin \
+    libc6 \
+    libc6-dev \
     libcurl3t64-gnutls \
     libcurl4t64 \
+    libexpat1 \
     libgcrypt20 \
+    libglib2.0-0t64 \
+    libglib2.0-data \
     libgnutls30t64 \
     libgssapi-krb5-2 \
     libk5crypto3 \
     libkrb5-3 \
     libkrb5support0 \
+    libperl5.38t64 \
+    libpython3.12-minimal \
+    libpython3.12-stdlib \
     libssl-dev \
     libssl3t64 \
     libsqlite3-0 \
+    libxml2 \
+    locales \
     nginx \
     nginx-common \
     nginx-light \
+    openssh-client \
+    openssh-server \
+    openssh-sftp-server \
     openssl \
+    perl \
+    perl-base \
+    perl-modules-5.38 \
+    python3.12 \
+    python3.12-minimal \
+    rsyslog \
     sqlite3 \
+    sudo \
     tar \
     wget \
     liblzma5 \
@@ -74,3 +97,20 @@ RUN pip install --no-cache-dir -r requirements.txt 'aiohttp>=3.14.0' 'requests>=
 
 # The below file is required for baking the code into the environment
 COPY data_import_run.py /azureml/data_import/run.py
+
+# Refresh packages for the latest Ubuntu security advisories.
+RUN set -eux; \
+    apt-get update; \
+    security_packages="libssl-dev libssl3t64 openssl"; \
+    installed_packages=""; \
+    for package in $security_packages; do \
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then \
+            installed_packages="$installed_packages $package"; \
+        fi; \
+    done; \
+    if [ -n "$installed_packages" ]; then apt-get install -y --only-upgrade $installed_packages; fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Reassert newly patched transitive dependencies after all package installs.
+RUN /opt/miniconda/bin/python -m pip install --no-cache-dir --upgrade 'PyJWT>=2.15.0'
