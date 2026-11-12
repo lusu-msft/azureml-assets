@@ -39,7 +39,7 @@ RUN printf '%s\n' 'msgpack>=1.2.1' 'setuptools>=83.0.0' > /tmp/pip-security-cons
     scikit-learn-intelex==2026.2.0 \
     azureml-core==1.61.0.post4 \
     azureml-defaults==1.62.0 \
-    azureml-inference-server-http==1.5.1 \
+    azureml-inference-server-http==1.6.1 \
     azureml-mlflow==1.62.0.post6 \
     azureml-telemetry==1.62.0 \
     'scikit-learn~=1.5.0' \
